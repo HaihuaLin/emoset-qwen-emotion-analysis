@@ -1,6 +1,7 @@
 import os
 import glob
 import shutil
+import zipfile
 import torch
 from PIL import Image
 from modelscope import snapshot_download
@@ -23,47 +24,40 @@ EMOTION_CATEGORIES = [
     "sadness"       # 悲伤
 ]
 
-def check_and_migrate_cached_model():
-    """检查 /root/.cache 目录下是否有之前下载过的模型，有则自动迁移到项目目录以释放系统盘空间"""
-    if os.path.exists(MODELS_DIR) and len(os.listdir(MODELS_DIR)) > 0:
-        return MODELS_DIR
-
-    # 常见 ModelScope 缓存路径
-    cache_base = os.path.expanduser("~/.cache/modelscope/models/Qwen--Qwen3.5-4B")
-    if os.path.exists(cache_base):
-        snapshots = glob.glob(os.path.join(cache_base, "snapshots", "*"))
-        if snapshots and os.path.exists(snapshots[0]):
-            cached_snapshot = snapshots[0]
-            print(f"[*] 发现之前下载在系统缓存中的模型: {cached_snapshot}")
-            print(f"[*] 正在自动将其转移至项目目录: {MODELS_DIR}（无需重新下载，且释放 /root 空间）...")
-            os.makedirs(os.path.dirname(MODELS_DIR), exist_ok=True)
-            shutil.move(cached_snapshot, MODELS_DIR)
-            # 尝试清理旧缓存目录
-            try:
-                shutil.rmtree(cache_base, ignore_errors=True)
-            except Exception:
-                pass
-            print(f"[*] 迁移完成！模型现位于: {MODELS_DIR}")
-            return MODELS_DIR
-    return None
-
 def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
-    print(f"[1/4] 正在加载模型（目标项目路径: {MODELS_DIR}）...")
+    print(f"[1/4] 正在准备模型（目标路径: {MODELS_DIR}）...")
     
-    # 1. 优先检查项目目录或从旧缓存迁移
-    model_dir = check_and_migrate_cached_model()
+    # 1. 检查项目本地 models/ 目录
+    if os.path.exists(MODELS_DIR) and len(os.listdir(MODELS_DIR)) > 0:
+        print(f"[*] 发现项目本地已存在的模型文件: {MODELS_DIR}")
+        model_dir = MODELS_DIR
+    else:
+        # 检查是否之前下载到了 /root/.cache，有则直接迁移（无需重新下载）
+        cache_base = os.path.expanduser("~/.cache/modelscope/models/Qwen--Qwen3.5-4B")
+        migrated = False
+        if os.path.exists(cache_base):
+            snapshots = glob.glob(os.path.join(cache_base, "snapshots", "*"))
+            if snapshots and os.path.exists(snapshots[0]):
+                cached_path = snapshots[0]
+                print(f"[*] 发现系统缓存中的模型，正在自动转移至: {MODELS_DIR} (释放系统盘空间)...")
+                os.makedirs(os.path.dirname(MODELS_DIR), exist_ok=True)
+                shutil.move(cached_path, MODELS_DIR)
+                try:
+                    shutil.rmtree(cache_base, ignore_errors=True)
+                except Exception:
+                    pass
+                model_dir = MODELS_DIR
+                migrated = True
+        
+        if not migrated:
+            print(f"[*] 正在从 ModelScope 下载模型至项目目录: {MODELS_DIR} ...")
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            try:
+                model_dir = snapshot_download(model_id, local_dir=MODELS_DIR)
+            except Exception:
+                model_dir = snapshot_download(model_id, cache_dir=os.path.join(PROJECT_ROOT, "models"))
     
-    # 2. 如果项目目录依然没有，则通过 ModelScope 精准下载到 MODELS_DIR
-    if not model_dir or not os.path.exists(model_dir):
-        print(f"[*] 正在将模型直接下载并存储至项目目录: {MODELS_DIR} ...")
-        os.makedirs(MODELS_DIR, exist_ok=True)
-        try:
-            model_dir = snapshot_download(model_id, local_dir=MODELS_DIR)
-        except Exception:
-            model_dir = snapshot_download(model_id, cache_dir=os.path.join(PROJECT_ROOT, "models"))
-    
-    print(f"模型加载就绪，路径: {model_dir}")
-
+    print(f"[*] 模型路径确认: {model_dir}")
     print("[2/4] 正在加载 Processor 与 Model 进入显卡 (A10)...")
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
     
@@ -77,32 +71,54 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
         trust_remote_code=True
     )
     model.eval()
-    print(f"模型已就绪，运行设备: {model.device}, 数据类型: {torch_dtype}")
+    print(f"[*] 模型已就绪，运行设备: {model.device}, 数据类型: {torch_dtype}")
     return model, processor
 
-def load_dataset_samples(num_samples=3):
-    print(f"[3/4] 正在检查项目数据目录: {DATA_DIR} ...")
-    samples = []
+def load_dataset_samples(dataset_id="weisir001/EmoSet", num_samples=3):
+    print(f"[3/4] 正在准备数据集（目标路径: {DATA_DIR}）...")
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    # 扫描项目本地 data/EmoSet 目录下的图像
+    # 扫描是否已有图片
     exts = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
     image_paths = []
-    if os.path.exists(DATA_DIR):
+    for ext in exts:
+        image_paths.extend(glob.glob(os.path.join(DATA_DIR, "**", ext), recursive=True))
+
+    # 如果尚未下载解压，通过原生方式下载并解压
+    if not image_paths:
+        print(f"[*] 正在从 ModelScope 原生通道下载数据集至: {DATA_DIR} (支持断点续传)...")
+        try:
+            snapshot_download(dataset_id, repo_type='dataset', local_dir=DATA_DIR)
+        except Exception:
+            from modelscope.hub.snapshot_download import dataset_snapshot_download
+            dataset_snapshot_download(dataset_id, cache_dir=os.path.join(PROJECT_ROOT, "data"))
+
+        # 检查并解压 EmoSet.zip
+        zip_path = os.path.join(DATA_DIR, "EmoSet.zip")
+        if not os.path.exists(zip_path):
+            for root, _, files in os.walk(DATA_DIR):
+                for f in files:
+                    if f.endswith(".zip"):
+                        zip_path = os.path.join(root, f)
+                        break
+
+        extract_dir = os.path.join(DATA_DIR, "extracted")
+        if os.path.exists(zip_path):
+            if not os.path.exists(extract_dir) or len(os.listdir(extract_dir)) == 0:
+                print(f"[*] 正在解压 {zip_path} 至 {extract_dir} ...")
+                os.makedirs(extract_dir, exist_ok=True)
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                print("[*] 解压完成！")
+
         for ext in exts:
             image_paths.extend(glob.glob(os.path.join(DATA_DIR, "**", ext), recursive=True))
 
-    # 如果本地还没有下载数据集，提示或尝试下载
     if not image_paths:
-        print(f"[*] 项目目录 {DATA_DIR} 暂无图片，正在自动调用下载与解压...")
-        from download_dataset import download_and_extract_dataset
-        download_and_extract_dataset("weisir001/EmoSet")
-        for ext in exts:
-            image_paths.extend(glob.glob(os.path.join(DATA_DIR, "**", ext), recursive=True))
+        raise FileNotFoundError(f"未能在 {DATA_DIR} 中找到图片！")
 
-    if not image_paths:
-        raise FileNotFoundError(f"未能在 {DATA_DIR} 中找到图片！请先运行 python download_dataset.py 下载数据。")
-
-    print(f"[*] 在项目数据目录中发现 {len(image_paths)} 张图片，挑选前 {num_samples} 张进行测试。")
+    print(f"[*] 在数据集目录中发现 {len(image_paths)} 张图片，挑选前 {num_samples} 张进行测试。")
+    samples = []
     for p in image_paths[:num_samples]:
         parent_dir = os.path.basename(os.path.dirname(p))
         inferred_label = parent_dir if parent_dir in EMOTION_CATEGORIES else "未知"
@@ -170,11 +186,11 @@ def main():
     print("      Qwen3.5-4B 零样本（Zero-shot）图像情感分析测试")
     print("=" * 60)
 
-    # 1. 加载模型（自动迁移或存储在项目目录 models/ 下）
+    # 1. 加载模型（位置: /mnt/workspace/emoset-qwen-emotion-analysis/models/）
     model, processor = load_model_and_processor("Qwen/Qwen3.5-4B")
 
-    # 2. 加载数据集（存储在项目目录 data/ 下）
-    samples = load_dataset_samples(num_samples=3)
+    # 2. 加载数据集（位置: /mnt/workspace/emoset-qwen-emotion-analysis/data/）
+    samples = load_dataset_samples("weisir001/EmoSet", num_samples=3)
 
     print("\n[4/4] 开始进行零样本推理测试...")
     for idx, sample in enumerate(samples):
