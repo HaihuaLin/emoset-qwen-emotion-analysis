@@ -1,7 +1,8 @@
 import os
+import glob
 import torch
 from PIL import Image
-from modelscope import snapshot_download, MsDataset
+from modelscope import snapshot_download
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 # EmoSet 定义的 8 种基础离散情感类别
@@ -40,15 +41,57 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
 
 def load_dataset_samples(dataset_id="weisir001/EmoSet", num_samples=3):
     print(f"[3/4] 正在从 ModelScope 加载数据集: {dataset_id} ...")
-    # 尝试加载测试集或训练集
+    samples = []
+
+    # 方案 1：优先尝试通过 MsDataset 加载
     try:
-        ds = MsDataset.load(dataset_id, split='test')
+        from modelscope.msdatasets import MsDataset
+        print("尝试通过 MsDataset 加载数据集...")
+        try:
+            ds = MsDataset.load(dataset_id, split='test')
+        except Exception:
+            ds = MsDataset.load(dataset_id, split='train')
+        
+        for idx, item in enumerate(ds):
+            if idx >= num_samples:
+                break
+            samples.append(item)
+        if len(samples) > 0:
+            print(f"MsDataset 加载成功，提取到 {len(samples)} 个测试样本。")
+            return samples
+    except Exception as e:
+        print(f"MsDataset 加载跳过 ({e})，切换为本地 snapshot_download 模式下载数据集...")
+
+    # 方案 2：如果 MsDataset 依赖缺失，使用 dataset_snapshot_download 直接下载文件
+    try:
+        from modelscope.hub.snapshot_download import dataset_snapshot_download
+        dataset_dir = dataset_snapshot_download(dataset_id)
     except Exception:
-        print("未找到 test 分割，尝试加载 train 分割...")
-        ds = MsDataset.load(dataset_id, split='train')
+        dataset_dir = snapshot_download(dataset_id, repo_type='dataset')
     
-    print(f"数据集加载成功，样本总数: {len(ds)}")
-    return ds
+    print(f"数据集已下载至本地目录: {dataset_dir}")
+    
+    # 扫描目录下的图像文件
+    exts = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
+    image_paths = []
+    for ext in exts:
+        image_paths.extend(glob.glob(os.path.join(dataset_dir, "**", ext), recursive=True))
+    
+    if not image_paths:
+        raise FileNotFoundError(f"在数据集目录 {dataset_dir} 中未找到可用图片！")
+
+    print(f"在数据集目录中发现 {len(image_paths)} 张图片，挑选前 {num_samples} 张进行测试。")
+    for p in image_paths[:num_samples]:
+        # 从文件夹名称或路径中推测情感标签（如 /amusement/001.jpg）
+        parent_dir = os.path.basename(os.path.dirname(p))
+        inferred_label = parent_dir if parent_dir in EMOTION_CATEGORIES else "未知"
+        samples.append({
+            'image': Image.open(p).convert("RGB"),
+            'label': inferred_label,
+            'file_path': p
+        })
+
+    return samples
 
 def run_zero_shot_inference(model, processor, image, ground_truth=None):
     prompt_text = (
@@ -113,13 +156,10 @@ def main():
     model, processor = load_model_and_processor("Qwen/Qwen3.5-4B")
 
     # 2. 加载数据集
-    dataset = load_dataset_samples("weisir001/EmoSet", num_samples=3)
+    samples = load_dataset_samples("weisir001/EmoSet", num_samples=3)
 
     print("\n[4/4] 开始进行零样本推理测试...")
-    for idx, sample in enumerate(dataset):
-        if idx >= 3:  # 默认测试前 3 张样例
-            break
-
+    for idx, sample in enumerate(samples):
         print("\n" + "-" * 50)
         print(f"【样本 #{idx + 1}】")
 
@@ -140,6 +180,8 @@ def main():
 
         # 获取真实标签（如果存在）
         gt_label = sample.get('label') or sample.get('emotion') or sample.get('category') or "未知"
+        if 'file_path' in sample:
+            print(f"文件路径: {sample['file_path']}")
         print(f"真实标注情感 (Ground Truth): {gt_label}")
 
         # 模型推理
