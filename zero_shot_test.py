@@ -24,8 +24,19 @@ EMOTION_CATEGORIES = [
     "sadness"       # 悲伤
 ]
 
+def clean_stale_locks():
+    """清理因之前 Ctrl+C 中断残留的 ModelScope 文件锁，防止死锁等待"""
+    lock_dir = os.path.expanduser("~/.cache/modelscope/.lock")
+    if os.path.exists(lock_dir):
+        try:
+            shutil.rmtree(lock_dir, ignore_errors=True)
+            print("[*] 已自动清理历史残留的文件锁 (.lock)...")
+        except Exception:
+            pass
+
 def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
     print(f"[1/4] 正在准备模型（目标路径: {MODELS_DIR}）...")
+    clean_stale_locks()
     
     # 1. 检查项目本地 models/ 目录
     if os.path.exists(MODELS_DIR) and len(os.listdir(MODELS_DIR)) > 0:
@@ -76,6 +87,7 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
 
 def load_dataset_samples(dataset_id="weisir001/EmoSet", num_samples=3):
     print(f"[3/4] 正在准备数据集（目标路径: {DATA_DIR}）...")
+    clean_stale_locks()
     os.makedirs(DATA_DIR, exist_ok=True)
 
     # 扫描是否已有图片
