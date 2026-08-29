@@ -1,0 +1,7 @@
+modelscope>=1.15.0
+transformers>=4.45.0
+accelerate
+torch
+torchvision
+pillow
+timm
