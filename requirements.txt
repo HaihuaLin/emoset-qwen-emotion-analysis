@@ -1,6 +1,7 @@
 # 预装 NGC/PyTorch 环境中已有 torch/torchvision，无需重复覆盖安装
 modelscope>=1.15.0
-datasets
+datasets>=2.18.0
+huggingface-hub>=0.20.0
 transformers>=4.45.0
 accelerate
 pillow
