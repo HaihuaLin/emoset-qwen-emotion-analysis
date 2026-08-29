@@ -1,5 +1,6 @@
 import os
 import glob
+import shutil
 import torch
 from PIL import Image
 from modelscope import snapshot_download
@@ -22,17 +23,41 @@ EMOTION_CATEGORIES = [
     "sadness"       # 悲伤
 ]
 
+def check_and_migrate_cached_model():
+    """检查 /root/.cache 目录下是否有之前下载过的模型，有则自动迁移到项目目录以释放系统盘空间"""
+    if os.path.exists(MODELS_DIR) and len(os.listdir(MODELS_DIR)) > 0:
+        return MODELS_DIR
+
+    # 常见 ModelScope 缓存路径
+    cache_base = os.path.expanduser("~/.cache/modelscope/models/Qwen--Qwen3.5-4B")
+    if os.path.exists(cache_base):
+        snapshots = glob.glob(os.path.join(cache_base, "snapshots", "*"))
+        if snapshots and os.path.exists(snapshots[0]):
+            cached_snapshot = snapshots[0]
+            print(f"[*] 发现之前下载在系统缓存中的模型: {cached_snapshot}")
+            print(f"[*] 正在自动将其转移至项目目录: {MODELS_DIR}（无需重新下载，且释放 /root 空间）...")
+            os.makedirs(os.path.dirname(MODELS_DIR), exist_ok=True)
+            shutil.move(cached_snapshot, MODELS_DIR)
+            # 尝试清理旧缓存目录
+            try:
+                shutil.rmtree(cache_base, ignore_errors=True)
+            except Exception:
+                pass
+            print(f"[*] 迁移完成！模型现位于: {MODELS_DIR}")
+            return MODELS_DIR
+    return None
+
 def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
     print(f"[1/4] 正在加载模型（目标项目路径: {MODELS_DIR}）...")
     
-    # 优先从项目本地 models/ 目录加载，如果不存在则自动下载到该目录
-    if os.path.exists(MODELS_DIR) and len(os.listdir(MODELS_DIR)) > 0:
-        print(f"[*] 发现项目本地已存在的模型文件: {MODELS_DIR}")
-        model_dir = MODELS_DIR
-    else:
-        # 如果 /root/.cache 中有之前下好的，也可以直接利用，或指定 local_dir 下载到项目目录
+    # 1. 优先检查项目目录或从旧缓存迁移
+    model_dir = check_and_migrate_cached_model()
+    
+    # 2. 如果项目目录依然没有，则通过 ModelScope 精准下载到 MODELS_DIR
+    if not model_dir or not os.path.exists(model_dir):
+        print(f"[*] 正在将模型直接下载并存储至项目目录: {MODELS_DIR} ...")
+        os.makedirs(MODELS_DIR, exist_ok=True)
         try:
-            print(f"[*] 正在将模型下载并存储至项目目录: {MODELS_DIR} ...")
             model_dir = snapshot_download(model_id, local_dir=MODELS_DIR)
         except Exception:
             model_dir = snapshot_download(model_id, cache_dir=os.path.join(PROJECT_ROOT, "models"))
@@ -145,7 +170,7 @@ def main():
     print("      Qwen3.5-4B 零样本（Zero-shot）图像情感分析测试")
     print("=" * 60)
 
-    # 1. 加载模型（存储在项目目录 models/ 下）
+    # 1. 加载模型（自动迁移或存储在项目目录 models/ 下）
     model, processor = load_model_and_processor("Qwen/Qwen3.5-4B")
 
     # 2. 加载数据集（存储在项目目录 data/ 下）
