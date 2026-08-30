@@ -1,6 +1,7 @@
 # 忽略模型与大型数据集目录，避免误提交到 GitHub
 models/
 data/
+output/
 *.zip
 *.safetensors
 *.bin
