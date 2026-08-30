@@ -117,6 +117,11 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B", gradient_checkpointing=
         trust_remote_code=True
     )
 
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.padding_side = "right"
+        if processor.tokenizer.pad_token_id is None:
+            processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
         if hasattr(model, "enable_input_require_grads"):
@@ -139,6 +144,8 @@ def setup_lora(model, lora_r=16, lora_alpha=32, lora_dropout=0.05):
         bias="none"
     )
     model = get_peft_model(model, lora_config)
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     model.print_trainable_parameters()
     return model
 
