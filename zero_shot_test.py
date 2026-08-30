@@ -5,7 +5,16 @@ import zipfile
 import torch
 from PIL import Image
 from modelscope import snapshot_download
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoProcessor
+
+# 动态加载最适配多模态视觉任务的模型类
+try:
+    from transformers import AutoModelForImageTextToText as AutoModelClass
+except ImportError:
+    try:
+        from transformers import AutoModelForVision2Seq as AutoModelClass
+    except ImportError:
+        from transformers import AutoModelForCausalLM as AutoModelClass
 
 # 获取项目根目录路径 (/mnt/workspace/emoset-qwen-emotion-analysis)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +52,6 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
         print(f"[*] 发现项目本地已存在的模型文件: {MODELS_DIR}")
         model_dir = MODELS_DIR
     else:
-        # 检查是否之前下载到了 /root/.cache，有则直接迁移（无需重新下载）
         cache_base = os.path.expanduser("~/.cache/modelscope/models/Qwen--Qwen3.5-4B")
         migrated = False
         if os.path.exists(cache_base):
@@ -69,16 +77,16 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B"):
                 model_dir = snapshot_download(model_id, cache_dir=os.path.join(PROJECT_ROOT, "models"))
     
     print(f"[*] 模型路径确认: {model_dir}")
-    print("[2/4] 正在加载 Processor 与 Model 进入显卡 (A10)...")
+    print(f"[2/4] 正在加载 Processor 与 {AutoModelClass.__name__} 进入显卡 (A10)...")
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
     
     device_map = "auto" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else (torch.float16 if torch.cuda.is_available() else torch.float32)
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelClass.from_pretrained(
         model_dir,
         device_map=device_map,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         trust_remote_code=True
     )
     model.eval()
@@ -90,13 +98,11 @@ def load_dataset_samples(dataset_id="weisir001/EmoSet", num_samples=3):
     clean_stale_locks()
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # 扫描是否已有图片
     exts = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
     image_paths = []
     for ext in exts:
         image_paths.extend(glob.glob(os.path.join(DATA_DIR, "**", ext), recursive=True))
 
-    # 如果尚未下载解压，通过原生方式下载并解压
     if not image_paths:
         print(f"[*] 正在从 ModelScope 原生通道下载数据集至: {DATA_DIR} (支持断点续传)...")
         try:
@@ -105,7 +111,6 @@ def load_dataset_samples(dataset_id="weisir001/EmoSet", num_samples=3):
             from modelscope.hub.snapshot_download import dataset_snapshot_download
             dataset_snapshot_download(dataset_id, cache_dir=os.path.join(PROJECT_ROOT, "data"))
 
-        # 检查并解压 EmoSet.zip
         zip_path = os.path.join(DATA_DIR, "EmoSet.zip")
         if not os.path.exists(zip_path):
             for root, _, files in os.walk(DATA_DIR):
@@ -178,6 +183,7 @@ def run_zero_shot_inference(model, processor, image, ground_truth=None):
         generated_ids = model.generate(
             **inputs,
             max_new_tokens=1024,
+            do_sample=True,
             temperature=0.7,
             top_p=0.8
         )
