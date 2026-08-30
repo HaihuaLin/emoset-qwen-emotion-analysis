@@ -238,10 +238,9 @@ def prepare_dataset_splits(mode="fast", custom_samples_per_class=None, seed=42):
     return train_samples, val_samples, test_samples
 
 class EmoSetMultiModalDataset(Dataset):
-    """EmoSet 多模态微调数据集类，支持 Prompt 掩码构建"""
-    def __init__(self, samples, processor):
+    """EmoSet 多模态数据集类"""
+    def __init__(self, samples):
         self.samples = samples
-        self.processor = processor
 
     def __len__(self):
         return len(self.samples)
@@ -256,13 +255,10 @@ class EmoSetMultiModalDataset(Dataset):
         except Exception:
             image = Image.new("RGB", (224, 224), color=(255, 255, 255))
 
-        # 构建对话
         user_content = [
             {"type": "image", "image": image},
             {"type": "text", "text": PROMPT_INSTRUCTION}
         ]
-        
-        # 完整回答
         assistant_content = [
             {"type": "text", "text": f"{label}"}
         ]
@@ -273,93 +269,63 @@ class EmoSetMultiModalDataset(Dataset):
             {"role": "assistant", "content": assistant_content}
         ]
 
-        # 1. 编码 Prompt (用于计算 Prompt Token 长度以进行 Loss Masking)
-        prompt_text = self.processor.apply_chat_template(
-            user_messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        prompt_inputs = self.processor(
-            text=[prompt_text],
-            images=[image],
-            return_tensors="pt"
-        )
-        prompt_token_len = prompt_inputs.input_ids.shape[1]
-
-        # 2. 编码完整序列 (Prompt + Assistant 回答)
-        full_text = self.processor.apply_chat_template(
-            full_messages,
-            tokenize=False,
-            add_generation_prompt=False
-        )
-        full_inputs = self.processor(
-            text=[full_text],
-            images=[image],
-            return_tensors="pt"
-        )
-
-        input_ids = full_inputs.input_ids[0]
-        attention_mask = full_inputs.attention_mask[0]
-        
-        # 3. 构造 Labels 并进行严格掩码（-100 过滤）
-        labels = input_ids.clone()
-        # 将 Prompt 区域（包括图像 token 与指令）全部置为 -100
-        labels[:prompt_token_len] = -100
-
-        item = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "image_path": file_path,
-            "label": label
+        return {
+            "image": image,
+            "user_messages": user_messages,
+            "full_messages": full_messages,
+            "label": label,
+            "file_path": file_path
         }
 
-        # 传递多模态视觉特征参数（如 pixel_values, image_grid_thw 等）
-        for k in full_inputs.keys():
-            if k not in ["input_ids", "attention_mask"]:
-                item[k] = full_inputs[k][0]
+class EmoSetDataCollator:
+    """多模态专用 Batch 整理器，使用官方 Processor 原生处理变长视觉张量与动态分辨率"""
+    def __init__(self, processor):
+        self.processor = processor
 
-        return item
+    def __call__(self, batch):
+        images = [item["image"] for item in batch]
+        user_messages_list = [item["user_messages"] for item in batch]
+        full_messages_list = [item["full_messages"] for item in batch]
 
-def multi_modal_collate_fn(batch):
-    """
-    多模态批处理整理函数，对不同长度的文本进行右填充 (Right Padding)
-    """
-    keys = batch[0].keys()
-    collated = {}
+        # 1. 构造 prompt 文本与完整对话文本
+        prompt_texts = [
+            self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            for msgs in user_messages_list
+        ]
+        full_texts = [
+            self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            for msgs in full_messages_list
+        ]
 
-    pad_token_id = 0
-    max_len = max(item["input_ids"].shape[0] for item in batch)
+        # 2. 官方 Processor 统一进行批处理与动态视觉 Patch 拼接
+        batch_inputs = self.processor(
+            text=full_texts,
+            images=images,
+            padding=True,
+            return_tensors="pt"
+        )
 
-    batch_input_ids = []
-    batch_attention_mask = []
-    batch_labels = []
+        # 3. 逐样本精确计算 Prompt Token 长度并构建 Labels 掩码 (-100 过滤)
+        labels = batch_inputs.input_ids.clone()
+        pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
 
-    for item in batch:
-        seq_len = item["input_ids"].shape[0]
-        pad_len = max_len - seq_len
+        for i, (p_text, img) in enumerate(zip(prompt_texts, images)):
+            single_p_inputs = self.processor(
+                text=[p_text],
+                images=[img],
+                return_tensors="pt"
+            )
+            p_len = single_p_inputs.input_ids.shape[1]
+            # 将 Prompt 与图像占位部分掩码为 -100
+            labels[i, :p_len] = -100
 
-        padded_input_ids = torch.cat([item["input_ids"], torch.full((pad_len,), pad_token_id, dtype=torch.long)])
-        padded_attention_mask = torch.cat([item["attention_mask"], torch.zeros((pad_len,), dtype=torch.long)])
-        padded_labels = torch.cat([item["labels"], torch.full((pad_len,), -100, dtype=torch.long)])
+        # 将 Batch Padding 区域也掩码为 -100
+        labels[batch_inputs.input_ids == pad_token_id] = -100
 
-        batch_input_ids.append(padded_input_ids)
-        batch_attention_mask.append(padded_attention_mask)
-        batch_labels.append(padded_labels)
-
-    collated["input_ids"] = torch.stack(batch_input_ids)
-    collated["attention_mask"] = torch.stack(batch_attention_mask)
-    collated["labels"] = torch.stack(batch_labels)
-
-    for k in keys:
-        if k in ["input_ids", "attention_mask", "labels", "image_path", "label"]:
-            continue
-        if isinstance(batch[0][k], torch.Tensor):
-            collated[k] = torch.stack([item[k] for item in batch])
-        else:
-            collated[k] = [item[k] for item in batch]
-
-    return collated
+        batch_inputs["labels"] = labels
+        return batch_inputs
 
 def plot_and_save_loss_curve(loss_history, output_path=LOSS_CURVE_PATH):
     """自动绘制训练 Loss 曲线与 Epoch 变化趋势"""
@@ -460,24 +426,25 @@ def main():
     model = setup_lora(model, lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
 
     # 4. 构建 DataLoader
-    train_dataset = EmoSetMultiModalDataset(train_samples, processor)
-    val_dataset = EmoSetMultiModalDataset(val_samples, processor) if val_samples else None
+    train_dataset = EmoSetMultiModalDataset(train_samples)
+    val_dataset = EmoSetMultiModalDataset(val_samples) if val_samples else None
+    data_collator = EmoSetDataCollator(processor)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=multi_modal_collate_fn,
-        num_workers=2,
-        pin_memory=True
+        collate_fn=data_collator,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=multi_modal_collate_fn,
-        num_workers=1
+        collate_fn=data_collator,
+        num_workers=0
     ) if val_dataset else None
 
     # 5. 优化器与学习率调度器
