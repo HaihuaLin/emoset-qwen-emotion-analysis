@@ -41,7 +41,7 @@ pip install -r requirements.txt
 
 ### 3. 执行 LoRA 微调训练（三档位可选）
 
-训练脚本已开启 `bfloat16`、`Gradient Checkpointing` 与 `Gradient Accumulation`（等效 Batch Size = 8），并具备实时 `tqdm` 进度条与 Loss 自动记录功能。
+训练脚本已默认启用 **4-bit NF4 QLoRA 极限显存量化**（基座权重仅占用 **~2.5 GB**，整机运行显存从 18G 骤降至 **~6-8 GB**），并开启 `PagedAdamW8bit` 优化器与 `Gradient Accumulation`（等效 Batch Size = 8），具备实时 `tqdm` 进度条与 Loss 自动记录。
 
 #### 🟢 档位 1：快速验证档 (`fast` - 强烈推荐首次运行)
 每类采样 500 张（总计 4,000 张），3 轮训练耗时约 **20 ~ 30 分钟**：

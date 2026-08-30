@@ -19,8 +19,8 @@ matplotlib.use('Agg')  # 无头绘图后端，支持服务器无界面运行
 import matplotlib.pyplot as plt
 
 from modelscope import snapshot_download
-from transformers import AutoProcessor, get_cosine_schedule_with_warmup
-from peft import LoraConfig, get_peft_model, TaskType
+from transformers import AutoProcessor, get_cosine_schedule_with_warmup, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 # 动态加载最适配多模态视觉任务的模型类
 try:
@@ -72,7 +72,7 @@ def clean_stale_locks():
         except Exception:
             pass
 
-def load_model_and_processor(model_id="Qwen/Qwen3.5-4B", gradient_checkpointing=True):
+def load_model_and_processor(model_id="Qwen/Qwen3.5-4B", precision="4bit", gradient_checkpointing=True):
     print(f"[1/4] 正在加载基座模型（目标路径: {MODELS_DIR}）...")
     clean_stale_locks()
     
@@ -105,30 +105,68 @@ def load_model_and_processor(model_id="Qwen/Qwen3.5-4B", gradient_checkpointing=
                 model_dir = snapshot_download(model_id, cache_dir=os.path.join(PROJECT_ROOT, "models"))
     
     print(f"[*] 模型路径确认: {model_dir}")
-    print(f"[2/4] 正在加载 Processor 与 {AutoModelClass.__name__} ...")
-    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+    print(f"[2/4] 正在加载 Processor 与 {AutoModelClass.__name__} (精度模式: {precision})...")
+    
+    # 限制单图 visual tokens 数量为 ~200-300，彻底消除异常大图显存暴涨
+    min_pixels = 256 * 28 * 28
+    max_pixels = 384 * 28 * 28
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_dir, 
+            min_pixels=min_pixels, 
+            max_pixels=max_pixels, 
+            trust_remote_code=True
+        )
+    except Exception:
+        processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
     
     device_map = "auto" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else (torch.float16 if torch.cuda.is_available() else torch.float32)
 
-    model = AutoModelClass.from_pretrained(
-        model_dir,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True
-    )
+    # 4-bit QLoRA 量化配置 (NF4 格式，显存暴降至 2.4G)
+    if precision == "4bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
+            bnb_4bit_use_double_quant=True
+        )
+        model = AutoModelClass.from_pretrained(
+            model_dir,
+            device_map=device_map,
+            quantization_config=bnb_config,
+            trust_remote_code=True
+        )
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
+        print(f"[*] 已成功启用 4-bit NF4 (QLoRA) 极限显存量化！基座权重占用仅 ~2.5 GB！")
+    elif precision == "8bit":
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        model = AutoModelClass.from_pretrained(
+            model_dir,
+            device_map=device_map,
+            quantization_config=bnb_config,
+            trust_remote_code=True
+        )
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
+        print(f"[*] 已成功启用 8-bit 量化！基座权重占用 ~4.5 GB！")
+    else:
+        model = AutoModelClass.from_pretrained(
+            model_dir,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True
+        )
+        if gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
 
     if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
         processor.tokenizer.padding_side = "right"
         if processor.tokenizer.pad_token_id is None:
             processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
 
-    if gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-
-    print(f"[*] 基座模型加载完成，运行设备: {model.device}, 数据类型: {torch_dtype}")
+    print(f"[*] 模型加载完成，运行设备: {model.device}, 运行精度: {precision}")
     return model, processor, model_dir
 
 def setup_lora(model, lora_r=16, lora_alpha=32, lora_dropout=0.05):
@@ -403,6 +441,8 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen3.5-4B EmoSet LoRA 三档位微调系统")
     parser.add_argument("--mode", type=str, default="fast", choices=["fast", "standard", "full"], 
                         help="训练档位选择: fast(快速验证, ~4k张), standard(标准科研, ~20k张), full(全量极限, ~85k张)")
+    parser.add_argument("--precision", type=str, default="4bit", choices=["4bit", "8bit", "bf16", "fp16"], 
+                        help="微调精度模式: 4bit(默认QLoRA，显存仅需~6G), 8bit(~10G), bf16(~18G), fp16")
     parser.add_argument("--samples_per_class", type=int, default=None, 
                         help="自定义每类训练样本数 (覆盖 mode 的默认采样量)")
     parser.add_argument("--epochs", type=int, default=3, help="训练轮数 (默认 3)")
@@ -419,7 +459,7 @@ def main():
 
     print("=" * 70)
     print("      🚀 Qwen3.5-4B EmoSet 多模态 LoRA 情感分析微调系统")
-    print(f"      档位模式: {args.mode} | 轮数: {args.epochs} | 等效 BatchSize: {args.batch_size * args.grad_accum}")
+    print(f"      档位模式: {args.mode} | 运行精度: {args.precision} | 轮数: {args.epochs} | 等效 BatchSize: {args.batch_size * args.grad_accum}")
     print("=" * 70)
 
     # 1. 准备数据集划分
@@ -429,8 +469,8 @@ def main():
         seed=args.seed
     )
 
-    # 2. 加载基座模型与 Processor
-    model, processor, _ = load_model_and_processor(gradient_checkpointing=True)
+    # 2. 加载基座模型与 Processor (支持 4-bit QLoRA 极限显存节省)
+    model, processor, _ = load_model_and_processor(precision=args.precision, gradient_checkpointing=True)
 
     # 3. 注入 LoRA
     model = setup_lora(model, lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
@@ -457,11 +497,18 @@ def main():
         num_workers=0
     ) if val_dataset else None
 
-    # 5. 优化器与学习率调度器
+    # 5. 优化器与学习率调度器 (优先采用 PagedAdamW8bit 防显存尖峰)
     total_steps = (len(train_loader) // args.grad_accum) * args.epochs
     warmup_steps = max(10, int(total_steps * 0.05))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.PagedAdamW8bit(model.parameters(), lr=args.lr, weight_decay=0.01)
+        print("[*] 成功启用 8-bit PagedAdamW 优化器，彻底消除优化器显存尖峰！")
+    except Exception:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        print("[*] 启用标准 AdamW 优化器")
+
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -469,6 +516,7 @@ def main():
     )
 
     print("\n--- 训练超参数汇总 ---")
+    print(f"  - 运行精度模式: {args.precision}")
     print(f"  - 训练集样本数: {len(train_dataset):d}")
     print(f"  - 验证集样本数: {len(val_dataset) if val_dataset else 0:d}")
     print(f"  - 总迭代步数 (Global Steps): {total_steps:d}")

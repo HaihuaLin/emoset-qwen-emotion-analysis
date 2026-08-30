@@ -52,31 +52,65 @@ EMOTION_CN_TO_EN = {
     "悲伤": "sadness", "难过": "sadness", "伤心": "sadness", "忧郁": "sadness"
 }
 
-def load_lora_model_and_processor(lora_dir=DEFAULT_LORA_DIR):
-    print(f"[1/2] 正在加载基座模型与 LoRA 适配器...")
+def load_lora_model_and_processor(lora_dir=DEFAULT_LORA_DIR, precision="4bit"):
+    print(f"[1/2] 正在加载基座模型与 LoRA 适配器 (精度: {precision})...")
     print(f"      - 基座路径: {MODELS_DIR}")
     print(f"      - LoRA路径: {lora_dir}")
 
     if not os.path.exists(lora_dir):
         raise FileNotFoundError(f"❌ 未找到 LoRA 权重目录: {lora_dir}！请先运行 python train_lora.py 完成训练。")
 
-    processor = AutoProcessor.from_pretrained(MODELS_DIR, trust_remote_code=True)
+    min_pixels = 256 * 28 * 28
+    max_pixels = 384 * 28 * 28
+    try:
+        processor = AutoProcessor.from_pretrained(
+            MODELS_DIR,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            trust_remote_code=True
+        )
+    except Exception:
+        processor = AutoProcessor.from_pretrained(MODELS_DIR, trust_remote_code=True)
     
     device_map = "auto" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else (torch.float16 if torch.cuda.is_available() else torch.float32)
 
-    # 1. 加载基座
-    base_model = AutoModelClass.from_pretrained(
-        MODELS_DIR,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True
-    )
+    # 1. 加载基座 (支持 4bit / 8bit / bf16)
+    if precision == "4bit":
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
+            bnb_4bit_use_double_quant=True
+        )
+        base_model = AutoModelClass.from_pretrained(
+            MODELS_DIR,
+            device_map=device_map,
+            quantization_config=bnb_config,
+            trust_remote_code=True
+        )
+    elif precision == "8bit":
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        base_model = AutoModelClass.from_pretrained(
+            MODELS_DIR,
+            device_map=device_map,
+            quantization_config=bnb_config,
+            trust_remote_code=True
+        )
+    else:
+        base_model = AutoModelClass.from_pretrained(
+            MODELS_DIR,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True
+        )
 
     # 2. 挂载 LoRA
     model = PeftModel.from_pretrained(base_model, lora_dir)
     model.eval()
-    print(f"[*] LoRA 模型加载完成，运行设备: {model.device}, 数据类型: {torch_dtype}")
+    print(f"[*] LoRA 模型加载完成，运行设备: {model.device}, 精度: {precision}")
     return model, processor
 
 def collect_test_dataset_samples(samples_per_class=100, seed=42):
@@ -222,6 +256,7 @@ def load_zero_shot_baseline():
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.5-4B EmoSet LoRA 微调模型独立评测脚本")
     parser.add_argument("--lora_dir", type=str, default=DEFAULT_LORA_DIR, help="LoRA 适配器目录 (默认 output/qwen_lora_emoset)")
+    parser.add_argument("--precision", type=str, default="4bit", choices=["4bit", "8bit", "bf16", "fp16"], help="评测加载精度 (默认 4bit)")
     parser.add_argument("--samples_per_class", type=int, default=100, help="每类测试样本数 (默认 100)")
     parser.add_argument("--seed", type=int, default=42, help="随机种子 (与零样本评测保持一致)")
     args = parser.parse_args()
@@ -229,11 +264,12 @@ def main():
     print("=" * 70)
     print("      🎯 Qwen3.5-4B LoRA 微调模型效果评测与前后对比")
     print(f"      LoRA 权重路径: {args.lora_dir}")
+    print(f"      评测运行精度: {args.precision}")
     print(f"      独立测试集量: 8 类别 x {args.samples_per_class} 张 = {8 * args.samples_per_class} 张")
     print("=" * 70)
 
     # 1. 加载模型
-    model, processor = load_lora_model_and_processor(args.lora_dir)
+    model, processor = load_lora_model_and_processor(args.lora_dir, precision=args.precision)
 
     # 2. 收集测试集
     samples = collect_test_dataset_samples(samples_per_class=args.samples_per_class, seed=args.seed)
