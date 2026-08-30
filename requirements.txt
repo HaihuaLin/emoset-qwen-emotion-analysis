@@ -6,3 +6,4 @@ transformers>=4.45.0
 accelerate
 pillow
 timm
+tqdm
