@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import re
 import sys
 import glob
@@ -259,6 +260,8 @@ class EmoSetMultiModalDataset(Dataset):
 
         try:
             image = Image.open(file_path).convert("RGB")
+            # 限制图像最大边长为 448，防止超高分辨率图片产生数千个 visual token 导致显存暴涨 OOM
+            image.thumbnail((448, 448), Image.Resampling.BILINEAR)
         except Exception:
             image = Image.new("RGB", (224, 224), color=(255, 255, 255))
 
@@ -403,8 +406,8 @@ def main():
     parser.add_argument("--samples_per_class", type=int, default=None, 
                         help="自定义每类训练样本数 (覆盖 mode 的默认采样量)")
     parser.add_argument("--epochs", type=int, default=3, help="训练轮数 (默认 3)")
-    parser.add_argument("--batch_size", type=int, default=2, help="单卡单步 Batch Size (推荐 2)")
-    parser.add_argument("--grad_accum", type=int, default=4, help="梯度累积步数 (等效 Batch Size = batch_size * grad_accum = 8)")
+    parser.add_argument("--batch_size", type=int, default=1, help="单卡单步 Batch Size (推荐 1，极度稳定省显存)")
+    parser.add_argument("--grad_accum", type=int, default=8, help="梯度累积步数 (等效 Batch Size = batch_size * grad_accum = 8)")
     parser.add_argument("--lr", type=float, default=1e-4, help="初始学习率 (默认 1e-4)")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA Rank 维度 (默认 16)")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA Alpha 系数 (默认 32)")
@@ -512,20 +515,26 @@ def main():
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
-            inputs = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            
-            outputs = model(**inputs)
-            loss = outputs.loss
+            try:
+                inputs = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                
+                outputs = model(**inputs)
+                loss = outputs.loss
 
-            if loss is None:
+                if loss is None or torch.isnan(loss) or torch.isinf(loss):
+                    continue
+
+                loss_val = loss.item()
+                epoch_train_loss += loss_val
+                step_in_epoch += 1
+
+                loss_scaled = loss / args.grad_accum
+                loss_scaled.backward()
+            except torch.cuda.OutOfMemoryError:
+                print("\n[Warning] 捕获到单个异常大图引发的 OOM，已自动清理显存碎片并跳过，保证训练平稳推进！")
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
                 continue
-
-            loss_val = loss.item()
-            epoch_train_loss += loss_val
-            step_in_epoch += 1
-
-            loss_scaled = loss / args.grad_accum
-            loss_scaled.backward()
 
             if smooth_loss is None:
                 smooth_loss = loss_val
@@ -538,6 +547,10 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+
+                # 定期释放显存碎片
+                if global_step % 20 == 0:
+                    torch.cuda.empty_cache()
 
                 current_lr = lr_scheduler.get_last_lr()[0]
                 step_record = {
