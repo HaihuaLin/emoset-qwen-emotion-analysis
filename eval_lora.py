@@ -57,8 +57,14 @@ def load_lora_model_and_processor(lora_dir=DEFAULT_LORA_DIR, precision="4bit"):
     print(f"      - 基座路径: {MODELS_DIR}")
     print(f"      - LoRA路径: {lora_dir}")
 
+    # 如果默认路径不存在但存在 best 路径，自动无缝切换到 best 权重
     if not os.path.exists(lora_dir):
-        raise FileNotFoundError(f"❌ 未找到 LoRA 权重目录: {lora_dir}！请先运行 python train_lora.py 完成训练。")
+        best_dir = os.path.join(OUTPUT_DIR, "qwen_lora_emoset_best")
+        if os.path.exists(best_dir):
+            lora_dir = best_dir
+            print(f"[*] 检测到已保存的最佳权重，自动切换使用: {lora_dir}")
+        else:
+            raise FileNotFoundError(f"❌ 未找到 LoRA 权重目录: {lora_dir}！请先确认训练权重是否已保存。")
 
     min_pixels = 256 * 28 * 28
     max_pixels = 384 * 28 * 28
