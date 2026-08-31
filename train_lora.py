@@ -448,6 +448,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=3, help="训练轮数 (默认 3)")
     parser.add_argument("--batch_size", type=int, default=1, help="单卡单步 Batch Size (推荐 1，极度稳定省显存)")
     parser.add_argument("--grad_accum", type=int, default=8, help="梯度累积步数 (等效 Batch Size = batch_size * grad_accum = 8)")
+    parser.add_argument("--save_steps", type=int, default=200, help="每隔多少个 Global Step 自动保存一次权重 Checkpoint (默认 200)")
     parser.add_argument("--lr", type=float, default=1e-4, help="初始学习率 (默认 1e-4)")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA Rank 维度 (默认 16)")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA Alpha 系数 (默认 32)")
@@ -460,6 +461,7 @@ def main():
     print("=" * 70)
     print("      🚀 Qwen3.5-4B EmoSet 多模态 LoRA 情感分析微调系统")
     print(f"      档位模式: {args.mode} | 运行精度: {args.precision} | 轮数: {args.epochs} | 等效 BatchSize: {args.batch_size * args.grad_accum}")
+    print(f"      自动保存频率: 每 {args.save_steps} 步及每个 Epoch 结束自动保存 | 支持随时 Ctrl+C 中断安全保存")
     print("=" * 70)
 
     # 1. 准备数据集划分
@@ -548,111 +550,140 @@ def main():
     alpha_smooth = 0.95
     best_val_loss = float("inf")
     start_train_time = time.time()
+    interrupted_early = False
 
     print("\n" + "=" * 70)
     print("                  🔥 开始执行 LoRA 微调训练...")
     print("=" * 70)
 
-    # 7. 训练主循环
-    for epoch in range(1, args.epochs + 1):
-        epoch_start_time = time.time()
-        epoch_train_loss = 0.0
-        step_in_epoch = 0
+    try:
+        # 7. 训练主循环
+        for epoch in range(1, args.epochs + 1):
+            epoch_start_time = time.time()
+            epoch_train_loss = 0.0
+            step_in_epoch = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch", dynamic_ncols=True)
-        optimizer.zero_grad()
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch", dynamic_ncols=True)
+            optimizer.zero_grad()
 
-        for batch_idx, batch in enumerate(pbar):
-            try:
-                inputs = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                
-                outputs = model(**inputs)
-                loss = outputs.loss
+            for batch_idx, batch in enumerate(pbar):
+                try:
+                    inputs = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                    
+                    outputs = model(**inputs)
+                    loss = outputs.loss
 
-                if loss is None or torch.isnan(loss) or torch.isinf(loss):
+                    if loss is None or torch.isnan(loss) or torch.isinf(loss):
+                        continue
+
+                    loss_val = loss.item()
+                    epoch_train_loss += loss_val
+                    step_in_epoch += 1
+
+                    loss_scaled = loss / args.grad_accum
+                    loss_scaled.backward()
+                except torch.cuda.OutOfMemoryError:
+                    print("\n[Warning] 捕获到单个异常大图引发的 OOM，已自动清理显存碎片并跳过，保证训练平稳推进！")
+                    optimizer.zero_grad()
+                    torch.cuda.empty_cache()
                     continue
 
-                loss_val = loss.item()
-                epoch_train_loss += loss_val
-                step_in_epoch += 1
+                if smooth_loss is None:
+                    smooth_loss = loss_val
+                else:
+                    smooth_loss = alpha_smooth * smooth_loss + (1 - alpha_smooth) * loss_val
 
-                loss_scaled = loss / args.grad_accum
-                loss_scaled.backward()
-            except torch.cuda.OutOfMemoryError:
-                print("\n[Warning] 捕获到单个异常大图引发的 OOM，已自动清理显存碎片并跳过，保证训练平稳推进！")
-                optimizer.zero_grad()
-                torch.cuda.empty_cache()
-                continue
+                if (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(train_loader):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
 
-            if smooth_loss is None:
-                smooth_loss = loss_val
-            else:
-                smooth_loss = alpha_smooth * smooth_loss + (1 - alpha_smooth) * loss_val
+                    # 定期释放显存碎片
+                    if global_step % 20 == 0:
+                        torch.cuda.empty_cache()
 
-            if (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    step_record = {
+                        "step": global_step,
+                        "epoch": epoch,
+                        "loss": round(loss_val, 4),
+                        "smooth_loss": round(smooth_loss, 4),
+                        "lr": float(f"{current_lr:.2e}"),
+                        "timestamp": round(time.time() - start_train_time, 2)
+                    }
+                    loss_history["steps"].append(step_record)
 
-                # 定期释放显存碎片
-                if global_step % 20 == 0:
-                    torch.cuda.empty_cache()
+                    # 每 10 步刷新持久化 json
+                    if global_step % 10 == 0:
+                        with open(LOSS_HISTORY_PATH, "w", encoding="utf-8") as f:
+                            json.dump(loss_history, f, indent=2, ensure_ascii=False)
+
+                    # 步级自动保存权重 (防止中途额度不足丢失进度)
+                    if global_step % args.save_steps == 0:
+                        model.save_pretrained(LORA_OUTPUT_DIR)
+                        processor.save_pretrained(LORA_OUTPUT_DIR)
+                        plot_and_save_loss_curve(loss_history, LOSS_CURVE_PATH)
+
+                mem_info = ""
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                    mem_info = f"{allocated:.1f}G"
 
                 current_lr = lr_scheduler.get_last_lr()[0]
-                step_record = {
-                    "step": global_step,
-                    "epoch": epoch,
-                    "loss": round(loss_val, 4),
-                    "smooth_loss": round(smooth_loss, 4),
-                    "lr": float(f"{current_lr:.2e}"),
-                    "timestamp": round(time.time() - start_train_time, 2)
-                }
-                loss_history["steps"].append(step_record)
+                pbar.set_postfix({
+                    "Step": f"{global_step}/{total_steps}",
+                    "Loss": f"{loss_val:.4f}",
+                    "AvgLoss": f"{smooth_loss:.4f}",
+                    "LR": f"{current_lr:.2e}",
+                    "GPU": mem_info
+                })
 
-                if global_step % 10 == 0:
-                    with open(LOSS_HISTORY_PATH, "w", encoding="utf-8") as f:
-                        json.dump(loss_history, f, indent=2, ensure_ascii=False)
+            avg_train_loss = epoch_train_loss / max(1, step_in_epoch)
+            val_loss = None
+            if val_loader:
+                print(f"\n[*] 正在计算 Epoch {epoch} 验证集 Loss...")
+                val_loss = evaluate_validation_loss(model, val_loader, device)
+                print(f"    ✓ Epoch {epoch} 验证集 Loss: {val_loss:.4f}")
 
-            mem_info = ""
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                mem_info = f"{allocated:.1f}G"
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": round(avg_train_loss, 4),
+                "val_loss": round(val_loss, 4) if val_loss is not None else None,
+                "time_seconds": round(time.time() - epoch_start_time, 2)
+            }
+            loss_history["epochs"].append(epoch_record)
 
-            current_lr = lr_scheduler.get_last_lr()[0]
-            pbar.set_postfix({
-                "Step": f"{global_step}/{total_steps}",
-                "Loss": f"{loss_val:.4f}",
-                "AvgLoss": f"{smooth_loss:.4f}",
-                "LR": f"{current_lr:.2e}",
-                "GPU": mem_info
-            })
+            with open(LOSS_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(loss_history, f, indent=2, ensure_ascii=False)
+            plot_and_save_loss_curve(loss_history, LOSS_CURVE_PATH)
 
-        avg_train_loss = epoch_train_loss / max(1, step_in_epoch)
-        val_loss = None
-        if val_loader:
-            print(f"\n[*] 正在计算 Epoch {epoch} 验证集 Loss...")
-            val_loss = evaluate_validation_loss(model, val_loader, device)
-            print(f"    ✓ Epoch {epoch} 验证集 Loss: {val_loss:.4f}")
+            # 每个 Epoch 结束均无条件保存该 Epoch 权重与最新主权重
+            epoch_save_dir = os.path.join(OUTPUT_DIR, f"qwen_lora_emoset_epoch_{epoch}")
+            model.save_pretrained(epoch_save_dir)
+            model.save_pretrained(LORA_OUTPUT_DIR)
+            processor.save_pretrained(LORA_OUTPUT_DIR)
+            print(f"[*] ✓ Epoch {epoch} 权重已自动保存至: {epoch_save_dir} 及 {LORA_OUTPUT_DIR}")
 
-        epoch_record = {
-            "epoch": epoch,
-            "train_loss": round(avg_train_loss, 4),
-            "val_loss": round(val_loss, 4) if val_loss is not None else None,
-            "time_seconds": round(time.time() - epoch_start_time, 2)
-        }
-        loss_history["epochs"].append(epoch_record)
+            if val_loss is not None and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_dir = os.path.join(OUTPUT_DIR, "qwen_lora_emoset_best")
+                print(f"[*] 发现更佳验证集 Loss ({val_loss:.4f})，保存最佳权重至: {best_dir}")
+                model.save_pretrained(best_dir)
 
+    except KeyboardInterrupt:
+        interrupted_early = True
+        print("\n\n" + "!" * 70)
+        print("⚠️ 捕获到用户中断信号 (Ctrl+C / 额度告警)！")
+        print(f"[*] 正在执行紧急安全保存，将当前已训练的最新权重写入: {LORA_OUTPUT_DIR} ...")
+        model.save_pretrained(LORA_OUTPUT_DIR)
+        processor.save_pretrained(LORA_OUTPUT_DIR)
         with open(LOSS_HISTORY_PATH, "w", encoding="utf-8") as f:
             json.dump(loss_history, f, indent=2, ensure_ascii=False)
         plot_and_save_loss_curve(loss_history, LOSS_CURVE_PATH)
-
-        if val_loss is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_dir = os.path.join(OUTPUT_DIR, "qwen_lora_emoset_best")
-            print(f"[*] 发现更佳验证集 Loss ({val_loss:.4f})，保存最佳权重至: {best_dir}")
-            model.save_pretrained(best_dir)
+        print(f"[*] 安全保存完成！已训练步骤（Step {global_step}）权重完好无损，可直接运行 python eval_lora.py 进行评测！")
+        print("!" * 70 + "\n")
 
     print("\n" + "=" * 70)
     print("                  🎉 LoRA 微调训练圆满完成！")
